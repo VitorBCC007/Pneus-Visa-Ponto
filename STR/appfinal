@@ -1,0 +1,221 @@
+from flask import Flask, render_template, request, redirect, url_for, session, send_file, flash
+from pymongo import MongoClient
+from datetime import datetime
+import hashlib
+import openpyxl
+from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
+from io import BytesIO
+import pytz
+import os
+
+app = Flask(__name__)
+app.secret_key = os.urandom(24)
+
+# Conectar ao MongoDB
+client = MongoClient("mongodb://localhost:27017/")
+db = client['sistema_ponto']
+funcionarios_collection = db['funcionarios']
+pontos_collection = db['pontos']
+
+# Função para criptografar a senha
+def criptografar_senha(senha):
+    return hashlib.sha256(senha.encode()).hexdigest()
+
+# Função para criar o administrador, se não existir
+def criar_admin():
+    admin_user = "AdminPV"
+    admin_password = "Abacate123"
+    if not funcionarios_collection.find_one({'usuario': admin_user}):
+        admin = {
+            'nome_completo': 'Administrador',
+            'usuario': admin_user,
+            'senha': criptografar_senha(admin_password),
+            'data_cadastro': datetime.now().strftime('%Y-%m-%d'),
+            'role': 'admin'
+        }
+        funcionarios_collection.insert_one(admin)
+        print("Usuário administrador criado com sucesso.")
+    else:
+        print("Usuário administrador já existe.")
+
+# Cria o administrador ao iniciar o aplicativo
+criar_admin()
+
+# Função para obter a data e hora no fuso horário local
+def horario_local():
+    fuso_br = pytz.timezone("America/Sao_Paulo")
+    return datetime.now(fuso_br)
+
+@app.route('/')
+def login():
+    # Verifica se o usuário já está logado
+    if 'funcionario_id' in session:
+        return redirect(url_for('index'))
+    return render_template('login.html')
+
+@app.route('/login', methods=['POST'])
+def do_login():
+    usuario = request.form['username']
+    senha = criptografar_senha(request.form['password'])
+
+    funcionario = funcionarios_collection.find_one({'usuario': usuario, 'senha': senha})
+    if funcionario:
+        session['funcionario_id'] = str(funcionario['_id'])
+        session['nome'] = funcionario['nome_completo']
+        session['role'] = funcionario.get('role', 'funcionario')
+
+        if session['role'] == 'admin':
+            return redirect(url_for('cadastro'))
+        else:
+            registrar_ponto(funcionario['_id'])
+            return redirect(url_for('index'))
+    else:
+        flash("Login falhou. Verifique seu nome de usuário e senha.", "error")
+        return redirect(url_for('login'))
+
+# Função para registrar o ponto
+def registrar_ponto(funcionario_id):
+    ano_mes = horario_local().strftime('%Y-%m')
+    data_atual = horario_local().strftime('%Y-%m-%d')
+    hora_atual = horario_local().strftime('%H:%M:%S')
+
+    ponto_mensal = pontos_collection.find_one({'funcionario_id': funcionario_id, 'mes_ano': ano_mes})
+    if not ponto_mensal:
+        ponto_mensal = {
+            'funcionario_id': funcionario_id,
+            'mes_ano': ano_mes,
+            'dias': {}
+        }
+        pontos_collection.insert_one(ponto_mensal)
+
+    ponto_dia = ponto_mensal['dias'].get(data_atual, {
+        'hora_entrada': None,
+        'hora_saida': None,
+        'hora_entrada2': None,
+        'hora_saida2': None
+    })
+
+    if not ponto_dia['hora_entrada']:
+        ponto_dia['hora_entrada'] = hora_atual
+    elif not ponto_dia['hora_saida']:
+        ponto_dia['hora_saida'] = hora_atual
+    elif not ponto_dia['hora_entrada2']:
+        ponto_dia['hora_entrada2'] = hora_atual
+    elif not ponto_dia['hora_saida2']:
+        ponto_dia['hora_saida2'] = hora_atual
+
+    ponto_mensal['dias'][data_atual] = ponto_dia
+    pontos_collection.update_one({'_id': ponto_mensal['_id']}, {'$set': {'dias': ponto_mensal['dias']}})
+
+@app.route('/index')
+def index():
+    if 'nome' in session:
+        return f"Bem-vindo, {session['nome']}! Seu ponto foi registrado."
+    else:
+        return redirect(url_for('login'))
+
+@app.route('/cadastro')
+def cadastro():
+    if 'role' in session and session['role'] == 'admin':
+        return render_template('cadastro.html')
+    return redirect(url_for('login'))
+
+@app.route('/register', methods=['POST'])
+def do_register():
+    if 'role' in session and session['role'] == 'admin':
+        nome_completo = request.form['fullname']
+        usuario = request.form['username']
+        senha = criptografar_senha(request.form['password'])
+
+        if funcionarios_collection.find_one({'usuario': usuario}):
+            flash("Usuário já existe.", "error")
+            return redirect(url_for('cadastro'))
+
+        novo_funcionario = {
+            'nome_completo': nome_completo,
+            'usuario': usuario,
+            'senha': senha,
+            'data_cadastro': horario_local().strftime('%Y-%m-%d'),
+            'role': 'funcionario'
+        }
+        funcionarios_collection.insert_one(novo_funcionario)
+
+        flash("Funcionário cadastrado com sucesso.", "success")
+        return redirect(url_for('cadastro'))
+    return redirect(url_for('login'))
+
+@app.route('/gerar_relatorio')
+def gerar_relatorio():
+    ano_mes = request.args.get('mes')  # Exemplo: '2024-01' para janeiro de 2024
+    if not ano_mes:
+        return "Por favor, forneça um mês no formato AAAA-MM."
+
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = f"Relatório de Pontos - {ano_mes}"
+    
+    # Definindo o cabeçalho
+    headers = ["Nome Completo", "Data", "Hora Entrada", "Hora Saída", "Hora Entrada 2", "Hora Saída 2"]
+    sheet.append(headers)
+    
+    # Estilo do cabeçalho
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
+    header_alignment = Alignment(horizontal="center", vertical="center")
+    thin_border = Border(
+        left=Side(style="thin"), 
+        right=Side(style="thin"), 
+        top=Side(style="thin"), 
+        bottom=Side(style="thin")
+    )
+
+    # Aplicando estilos ao cabeçalho
+    for cell in sheet[1]:
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_alignment
+        cell.border = thin_border
+
+    # Inserindo dados
+    funcionarios = funcionarios_collection.find({'role': {'$ne': 'admin'}})
+    for funcionario in funcionarios:
+        pontos = pontos_collection.find_one({'funcionario_id': funcionario['_id'], 'mes_ano': ano_mes})
+        if pontos:
+            for data, ponto in pontos['dias'].items():
+                row = [
+                    funcionario['nome_completo'],
+                    data,
+                    ponto.get('hora_entrada', ''),
+                    ponto.get('hora_saida', ''),
+                    ponto.get('hora_entrada2', ''),
+                    ponto.get('hora_saida2', '')
+                ]
+                sheet.append(row)
+    
+    # Ajustes nas células de dados e largura das colunas
+    for row in sheet.iter_rows(min_row=2, max_row=sheet.max_row, max_col=len(headers)):
+        for cell in row:
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = thin_border
+
+    for column_cells in sheet.columns:
+        max_length = max(len(str(cell.value)) for cell in column_cells)
+        adjusted_width = max_length + 2
+        sheet.column_dimensions[column_cells[0].column_letter].width = adjusted_width
+
+    file_stream = BytesIO()
+    workbook.save(file_stream)
+    file_stream.seek(0)
+
+    return send_file(file_stream, as_attachment=True, download_name=f"relatorio_pontos_{ano_mes}.xlsx")
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    flash("Logout realizado com sucesso.", "success")
+    return redirect(url_for('login'))
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
+##/gerar_relatorio?mes=2024-11
+
